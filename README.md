@@ -59,9 +59,9 @@ Example:
    - Use AWS Systems Manager Session Manager (recommended)
    - Or SSH from on-premises network: `ssh -i your-key.pem ec2-user@<private-ip>`
 
-3. **Deploy your application**:
-   - The instance comes with Docker pre-installed
-   - Add your application deployment commands to the UserData section
+3. **Access your TODOD application**:
+   - App automatically deploys and runs on port 80
+   - Access via: `http://<private-ip>/todos`
 
 ## Security Features
 
@@ -76,6 +76,23 @@ Example:
 - Modify security group rules for your application ports
 - Adjust instance type based on your requirements
 - Add additional subnets for high availability
+
+## API Usage
+
+**List todos:**
+```bash
+curl http://<private-ip>/todos
+```
+
+**Add todo:**
+```bash
+curl -X POST -H "Content-Type: application/json" -d '{"text":"Buy milk"}' http://<private-ip>/todos
+```
+
+**Delete todo:**
+```bash
+curl -X DELETE http://<private-ip>/todos/1
+```
 
 ## Troubleshooting
 
