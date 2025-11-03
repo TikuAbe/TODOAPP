@@ -1,0 +1,273 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'TODOD App infrastructure with EC2 in private subnet connected to on-premises via VPN'
+
+Parameters:
+  KeyPairName:
+    Type: AWS::EC2::KeyPair::KeyName
+    Description: EC2 Key Pair for SSH access
+  
+  OnPremisesCIDR:
+    Type: String
+    Default: '10.0.0.0/16'
+    Description: CIDR block of your on-premises network
+  
+  InstanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues: [t3.micro, t3.small, t3.medium]
+    Description: EC2 instance type
+
+Resources:
+  # VPC
+  VPC:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: '172.16.0.0/16'
+      EnableDnsHostnames: true
+      EnableDnsSupport: true
+      Tags:
+        - Key: Name
+          Value: TododApp-VPC
+
+  # Private Subnet
+  PrivateSubnet:
+    Type: AWS::EC2::Subnet
+    Properties:
+      VpcId: !Ref VPC
+      CidrBlock: '172.16.1.0/24'
+      AvailabilityZone: !Select [0, !GetAZs '']
+      Tags:
+        - Key: Name
+          Value: TododApp-PrivateSubnet
+
+  # Internet Gateway (needed for VPN Gateway)
+  InternetGateway:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: TododApp-IGW
+
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      InternetGatewayId: !Ref InternetGateway
+
+  # Virtual Private Gateway
+  VPNGateway:
+    Type: AWS::EC2::VPNGateway
+    Properties:
+      Type: ipsec.1
+      Tags:
+        - Key: Name
+          Value: TododApp-VGW
+
+  VPCGatewayAttachment:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref VPC
+      VpnGatewayId: !Ref VPNGateway
+
+  # Customer Gateway (replace with your public IP)
+  CustomerGateway:
+    Type: AWS::EC2::CustomerGateway
+    Properties:
+      Type: ipsec.1
+      BgpAsn: 65000
+      IpAddress: 1.2.3.4  # Replace with your public IP
+      Tags:
+        - Key: Name
+          Value: TododApp-CGW
+
+  # VPN Connection
+  VPNConnection:
+    Type: AWS::EC2::VPNConnection
+    Properties:
+      Type: ipsec.1
+      StaticRoutesOnly: true
+      CustomerGatewayId: !Ref CustomerGateway
+      VpnGatewayId: !Ref VPNGateway
+      Tags:
+        - Key: Name
+          Value: TododApp-VPN
+
+  # VPN Connection Route
+  VPNConnectionRoute:
+    Type: AWS::EC2::VPNConnectionRoute
+    Properties:
+      VpnConnectionId: !Ref VPNConnection
+      DestinationCidrBlock: !Ref OnPremisesCIDR
+
+  # Route Table for Private Subnet
+  PrivateRouteTable:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref VPC
+      Tags:
+        - Key: Name
+          Value: TododApp-PrivateRT
+
+  PrivateSubnetRouteTableAssociation:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref PrivateSubnet
+      RouteTableId: !Ref PrivateRouteTable
+
+  # Route Propagation
+  VPNRoutePropagation:
+    Type: AWS::EC2::VPNGatewayRoutePropagation
+    DependsOn: VPCGatewayAttachment
+    Properties:
+      RouteTableIds:
+        - !Ref PrivateRouteTable
+      VpnGatewayId: !Ref VPNGateway
+
+  # Security Group - Only allows traffic from VPN Gateway
+  EC2SecurityGroup:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Security group for TODOD app EC2 instance
+      VpcId: !Ref VPC
+      SecurityGroupIngress:
+        - IpProtocol: tcp
+          FromPort: 22
+          ToPort: 22
+          CidrIp: !Ref OnPremisesCIDR
+          Description: SSH from on-premises
+        - IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          CidrIp: !Ref OnPremisesCIDR
+          Description: HTTP from on-premises
+        - IpProtocol: tcp
+          FromPort: 443
+          ToPort: 443
+          CidrIp: !Ref OnPremisesCIDR
+          Description: HTTPS from on-premises
+      Tags:
+        - Key: Name
+          Value: TododApp-SG
+
+  # IAM Role for EC2
+  EC2Role:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: ec2.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/AmazonSSMManagedInstanceCore
+
+  EC2InstanceProfile:
+    Type: AWS::IAM::InstanceProfile
+    Properties:
+      Roles:
+        - !Ref EC2Role
+
+  # EC2 Instance
+  EC2Instance:
+    Type: AWS::EC2::Instance
+    Properties:
+      ImageId: ami-0c02fb55956c7d316  # Amazon Linux 2 (update for your region)
+      InstanceType: !Ref InstanceType
+      KeyName: !Ref KeyPairName
+      SubnetId: !Ref PrivateSubnet
+      SecurityGroupIds:
+        - !Ref EC2SecurityGroup
+      IamInstanceProfile: !Ref EC2InstanceProfile
+      UserData:
+        Fn::Base64: !Sub |
+          #!/bin/bash
+          yum update -y
+          yum install -y docker
+          systemctl start docker
+          systemctl enable docker
+          usermod -a -G docker ec2-user
+          
+          # Deploy TODOD app
+          cd /home/ec2-user
+          cat > app.py << 'EOF'
+          from flask import Flask, jsonify, request
+          import json
+          import os
+          
+          app = Flask(__name__)
+          DATA_FILE = 'todos.json'
+          
+          def load_todos():
+              if os.path.exists(DATA_FILE):
+                  with open(DATA_FILE, 'r') as f:
+                      return json.load(f)
+              return []
+          
+          def save_todos(todos):
+              with open(DATA_FILE, 'w') as f:
+                  json.dump(todos, f)
+          
+          @app.route('/todos', methods=['GET'])
+          def list_todos():
+              return jsonify(load_todos())
+          
+          @app.route('/todos', methods=['POST'])
+          def add_todo():
+              todos = load_todos()
+              new_todo = {
+                  'id': max([t['id'] for t in todos], default=0) + 1,
+                  'text': request.json['text']
+              }
+              todos.append(new_todo)
+              save_todos(todos)
+              return jsonify(new_todo), 201
+          
+          @app.route('/todos/<int:todo_id>', methods=['DELETE'])
+          def delete_todo(todo_id):
+              todos = load_todos()
+              todos = [todo for todo in todos if todo['id'] != todo_id]
+              save_todos(todos)
+              return '', 204
+          
+          if __name__ == '__main__':
+              app.run(host='0.0.0.0', port=80)
+          EOF
+          
+          pip3 install flask
+          python3 app.py &
+      Tags:
+        - Key: Name
+          Value: TododApp-Instance
+
+Outputs:
+  VPCId:
+    Description: VPC ID
+    Value: !Ref VPC
+    Export:
+      Name: !Sub '${AWS::StackName}-VPC-ID'
+
+  PrivateSubnetId:
+    Description: Private Subnet ID
+    Value: !Ref PrivateSubnet
+    Export:
+      Name: !Sub '${AWS::StackName}-PrivateSubnet-ID'
+
+  EC2InstanceId:
+    Description: EC2 Instance ID
+    Value: !Ref EC2Instance
+    Export:
+      Name: !Sub '${AWS::StackName}-EC2-ID'
+
+  VPNConnectionId:
+    Description: VPN Connection ID
+    Value: !Ref VPNConnection
+    Export:
+      Name: !Sub '${AWS::StackName}-VPN-ID'
+
+  SecurityGroupId:
+    Description: Security Group ID
+    Value: !Ref EC2SecurityGroup
+    Export:
+      Name: !Sub '${AWS::StackName}-SG-ID'
